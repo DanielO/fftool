@@ -34,6 +34,7 @@
 
 import argparse
 import datetime
+import os.path
 import re
 import socket
 import struct
@@ -45,11 +46,7 @@ import webbrowser
 # Protocol cribbed from:
 # https://github.com/Slugger2k/FlashForgePrinterApi
 # https://github.com/DanMcInerney/flashforge-finder-api
-request_control_message = b'~M601 S1\r\n'
-request_info_message = b'~M115\r\n'
-request_head_position = b'~M114\r\n'
-request_temp = b'~M105\r\n'
-reply_status_re = re.compile(r'.*CMD M119 Received\.\r\nEndstop: X-max:(?P<xmax>[0-9]+) Y-max:(?P<ymax>[0-9]+) Z-max:(?P<zmax>[0-9]+)\r\nMachineStatus: (?P<status>[A-Z_-]+)\r\nMoveMode: (?P<movemode>[A-Z_-]+)\r\nStatus: S:(?P<s>[0-9]+) L:(?P<l>[0-9]+) J:(?P<j>[0-9]+) F:(?P<f>[0-9]+)\r\nLED: (?P<led>[0-9]+)\r\nCurrentFile: (?P<fname>.+)?\r\nok\r\n')
+
 cmdackre = re.compile(r'CMD [0-9A-Z]+ Received.')
 
 def main():
@@ -67,11 +64,6 @@ def main():
     parser_status.add_argument('host', help = 'Host to connect to (IP[:port])')
     parser_status.set_defaults(func = status)
 
-    parser_send = subparsers.add_parser('send', help = 'Send G-Code file to printer')
-    parser_send.add_argument('host', help = 'Host to connect to (IP[:port])')
-    parser_send.add_argument('file', help = 'G-Code file to send', type = argparse.FileType('rb'))
-    parser_send.set_defaults(func = send)
-
     parser_progress = subparsers.add_parser('progress', help = 'Display progress')
     parser_progress.add_argument('host', help = 'Host to connect to (IP[:port])')
     parser_progress.set_defaults(func = progress)
@@ -84,6 +76,25 @@ def main():
     parser_getimage.add_argument('host', help = 'Host to connect to (IP[:port])')
     parser_getimage.add_argument('image', help = 'Image path')
     parser_getimage.set_defaults(func = getimage)
+
+    parser_send = subparsers.add_parser('send', help = 'Send G-Code file to printer')
+    parser_send.add_argument('--print', help = 'Print file after upload')
+    parser_send.add_argument('host', help = 'Host to connect to (IP[:port])')
+    parser_send.add_argument('file', help = 'G-Code file to send', type = argparse.FileType('rb'))
+    parser_send.set_defaults(func = send)
+
+    parser_print = subparsers.add_parser('print', help = 'Print a file printer')
+    parser_print.add_argument('host', help = 'Host to connect to (IP[:port])')
+    parser_print.add_argument('file', help = 'File path')
+    parser_print.set_defaults(func = printfile)
+
+    parser_pause = subparsers.add_parser('pause', help = 'Pause printer')
+    parser_pause.add_argument('host', help = 'Host to connect to (IP[:port])')
+    parser_pause.set_defaults(func = pause)
+
+    parser_resume = subparsers.add_parser('resume', help = 'Resume printer')
+    parser_resume.add_argument('host', help = 'Host to connect to (IP[:port])')
+    parser_resume.set_defaults(func = resume)
 
     args = parser.parse_args()
     if args.func == None:
@@ -153,7 +164,7 @@ def progress(parser, args):
 def listfiles(parser, args):
     '''List files stored on printer'''
     s = connect(args.host)
-    sendcmd(s, b'~M661')
+    sendcmd(s, b'~M661\r\n')
     hdr = s.read(8)
     magic, nfiles = struct.unpack('>4sI', hdr)
     assert(magic == b'D\xaa\xaaD')
@@ -167,7 +178,7 @@ def listfiles(parser, args):
 def getimage(parser, args):
     '''Fetch preview image for file from printer and view it'''
     s = connect(args.host)
-    sendcmd(s, b'~M662 %s' % (bytes(args.image, 'ascii')))
+    sendcmd(s, b'~M662 %s\r\n' % (bytes(args.image, 'ascii')))
     hdr = s.read(8)
     magic, imglen = struct.unpack('>4sI', hdr)
     assert(magic == b'**\xa2\xa2')
@@ -178,13 +189,62 @@ def getimage(parser, args):
 
 def send(parser, args):
     s = connect(args.host)
-    fname = args.file.name
-    data = args.file.read()
-    flen = len(data)
+    fname = os.path.basename(args.file.name)
+    assert len(fname) <= 36
+
+    flen = args.file.seek(0, 2)
+    args.file.seek(0, 0)
+
     reply = sendcmd(s, bytes('~M28 %d 0:/user/%s\r\n' % (flen, fname), 'ascii'))
     list(map(print, reply))
-    s.write(data)
-    reply = sendcmd(s, bytes('~M29', 'ascii'))
+    BLOCKSIZE = 1024
+
+    bcount = 0
+    sent = 0
+    while True:
+        if bcount % 10 == 0:
+            print('\rProgress: %.1f %%' % (sent / flen * 100.0), end = '')
+        data = args.file.read(BLOCKSIZE)
+        if len(data) == 0:
+            break
+        s.write(data)
+        s.flush()
+        sent += BLOCKSIZE
+        bcount += 1
+
+    # The M29 needs to go in a separate packet but flush doesn't do the trick
+    # Event setting TCP_NODELAY doesn't do it
+    s.flush()
+    time.sleep(0.1)
+    s.flush()
+    print('\nFinished transfer')
+    reply = sendcmd(s, b'~M29\r\n')
+    list(map(print, reply))
+    if args.print:
+        doprintfile(s, fname)
+
+def printfile(parser, args):
+    '''Tell the printer to print a file'''
+    s = connect(args.host)
+    reply = doprintfile(s, args.file)
+    list(map(print, reply))
+
+def doprintfile(s, fname):
+    if not fname.startswith('/'):
+        fname = '/user/' + fname
+
+    return sendcmd(s, b'~M23 0:%s\r\n' % (bytes(fname, 'ascii')))
+
+def pause(parser, args):
+    '''Pause printing'''
+    s = connect(args.host)
+    reply = sendcmd(s, b'~M25\r\n')
+    list(map(print, reply))
+
+def resume(parser, args):
+    '''Resume printing'''
+    s = connect(args.host)
+    reply = sendcmd(s, b'~M24\r\n')
     list(map(print, reply))
 
 if __name__ == '__main__':
